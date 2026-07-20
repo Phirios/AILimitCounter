@@ -40,6 +40,7 @@ struct UsageWindow {
     let utilization: Double
     let reset: Date
     let isRepresentative: Bool
+    let windowSeconds: TimeInterval?
 
     var percent: Int { Int(utilization * 100) }
 }
@@ -274,19 +275,22 @@ class UsageMonitor: ObservableObject {
             label: "5h",
             utilization: fiveHUtil,
             reset: fiveHReset,
-            isRepresentative: claim == "five_hour"
+            isRepresentative: claim == "five_hour",
+            windowSeconds: 5 * 3600
         )
         let secondary = UsageWindow(
             label: "7d",
             utilization: sevenDUtil,
             reset: sevenDReset,
-            isRepresentative: claim == "seven_day"
+            isRepresentative: claim == "seven_day",
+            windowSeconds: 7 * 24 * 3600
         )
         let overage = overageUtil > 0 ? UsageWindow(
             label: "Ovg",
             utilization: overageUtil,
             reset: overageReset,
-            isRepresentative: false
+            isRepresentative: false,
+            windowSeconds: nil
         ) : nil
 
         currentUsage = UsageData(
@@ -373,27 +377,33 @@ class UsageMonitor: ObservableObject {
               let payload = json["payload"] as? [String: Any],
               let limits = payload["rate_limits"] as? [String: Any],
               let primaryRaw = limits["primary"] as? [String: Any],
-              let secondaryRaw = limits["secondary"] as? [String: Any],
               let primaryUsed = jsonDouble(primaryRaw["used_percent"]),
-              let primaryReset = jsonDouble(primaryRaw["resets_at"]),
-              let secondaryUsed = jsonDouble(secondaryRaw["used_percent"]),
-              let secondaryReset = jsonDouble(secondaryRaw["resets_at"]) else {
+              let primaryReset = jsonDouble(primaryRaw["resets_at"]) else {
             return nil
         }
 
+        let secondaryRaw = limits["secondary"] as? [String: Any]
+        let secondaryUsed = secondaryRaw.flatMap { jsonDouble($0["used_percent"]) }
+        let secondaryReset = secondaryRaw.flatMap { jsonDouble($0["resets_at"]) }
+        let primaryWindowSeconds = codexWindowSeconds(primaryRaw)
+        let secondaryWindowSeconds = secondaryRaw.flatMap(codexWindowSeconds)
+        let primaryLabel = codexWindowLabel(primaryWindowSeconds) ?? "Limit"
+        let secondaryLabel = secondaryWindowSeconds.flatMap(codexWindowLabel) ?? "7d"
         let reachedType = limits["rate_limit_reached_type"] as? String
         let status = reachedType == nil ? "allowed" : "blocked"
         let primary = UsageWindow(
-            label: "5h",
+            label: primaryLabel,
             utilization: primaryUsed / 100,
             reset: Date(timeIntervalSince1970: primaryReset),
-            isRepresentative: primaryUsed >= secondaryUsed
+            isRepresentative: secondaryUsed.map { primaryUsed >= $0 } ?? true,
+            windowSeconds: primaryWindowSeconds
         )
         let secondary = UsageWindow(
-            label: "7d",
-            utilization: secondaryUsed / 100,
-            reset: Date(timeIntervalSince1970: secondaryReset),
-            isRepresentative: secondaryUsed > primaryUsed
+            label: secondaryUsed == nil ? primaryLabel : secondaryLabel,
+            utilization: (secondaryUsed ?? primaryUsed) / 100,
+            reset: Date(timeIntervalSince1970: secondaryReset ?? primaryReset),
+            isRepresentative: secondaryUsed.map { $0 > primaryUsed } ?? true,
+            windowSeconds: secondaryWindowSeconds ?? primaryWindowSeconds
         )
         let plan = limits["plan_type"] as? String
         let source = plan == nil
@@ -417,6 +427,37 @@ class UsageMonitor: ObservableObject {
             fetchedAt: Date(),
             source: sourceURL.lastPathComponent + " - " + source
         )
+    }
+
+    private func codexWindowSeconds(_ raw: [String: Any]) -> TimeInterval? {
+        if let seconds = jsonDouble(raw["limit_window_seconds"]) {
+            return seconds
+        }
+        if let minutes = jsonDouble(raw["window_minutes"]) {
+            return minutes * 60
+        }
+        return nil
+    }
+
+    private func codexWindowLabel(_ seconds: TimeInterval?) -> String? {
+        guard let seconds else { return nil }
+        let minutes = Int(seconds / 60)
+        switch minutes {
+        case 300:
+            return "5h"
+        case 10080:
+            return "7d"
+        case 43200:
+            return "30d"
+        default:
+            if minutes % 1440 == 0 {
+                return "\(minutes / 1440)d"
+            }
+            if minutes % 60 == 0 {
+                return "\(minutes / 60)h"
+            }
+            return "\(minutes)m"
+        }
     }
 
     private func jsonDouble(_ value: Any?) -> Double? {

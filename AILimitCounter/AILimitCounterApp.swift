@@ -160,13 +160,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ))
             menu.addItem(disabledItem("      Reset: \(relativeTime(usage.primary.reset))"))
 
-            menu.addItem(NSMenuItem.separator())
+            if !isSameWindow(usage.primary, usage.secondary) {
+                menu.addItem(NSMenuItem.separator())
 
-            let active7 = usage.secondary.isRepresentative ? " ◀" : ""
-            menu.addItem(coloredMenuItem(
-                label: "\(usage.secondary.label)  ", percent: usage.secondary.percent, suffix: active7
-            ))
-            menu.addItem(disabledItem("      Reset: \(relativeTime(usage.secondary.reset))"))
+                let active7 = usage.secondary.isRepresentative ? " ◀" : ""
+                menu.addItem(coloredMenuItem(
+                    label: "\(usage.secondary.label)  ", percent: usage.secondary.percent, suffix: active7
+                ))
+                menu.addItem(disabledItem("      Reset: \(relativeTime(usage.secondary.reset))"))
+            }
 
             if let overage = usage.overage, overage.percent > 0 {
                 menu.addItem(NSMenuItem.separator())
@@ -207,23 +209,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateButton(_ button: NSStatusBarButton) {
         if let usage = usageMonitor.currentUsage {
+            let hasSecondaryWindow = !isSameWindow(usage.primary, usage.secondary)
             button.image = drawFullStatusIcon(
                 sessionPercent: usage.primary.percent,
-                weeklyPercent: usage.secondary.percent,
+                weeklyPercent: hasSecondaryWindow ? usage.secondary.percent : nil,
                 blocked: usage.status != "allowed",
-                resetDate: usage.primary.reset
+                resetDate: usage.primary.reset,
+                resetWindowSeconds: usage.primary.windowSeconds
             )
             button.title = ""
         } else {
             button.image = drawFullStatusIcon(
-                sessionPercent: 0, weeklyPercent: 0,
-                blocked: false, resetDate: nil
+                sessionPercent: 0, weeklyPercent: nil,
+                blocked: false, resetDate: nil, resetWindowSeconds: nil
             )
             button.title = ""
         }
     }
 
-    private func drawFullStatusIcon(sessionPercent: Int, weeklyPercent: Int, blocked: Bool, resetDate: Date?) -> NSImage {
+    private func drawFullStatusIcon(sessionPercent: Int, weeklyPercent: Int?, blocked: Bool, resetDate: Date?, resetWindowSeconds: TimeInterval?) -> NSImage {
         let circleSize: CGFloat = 18
         let barHeight = 22.0  // menu bar height
         let gap: CGFloat = 4
@@ -277,9 +281,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSColor.tertiaryLabelColor.withAlphaComponent(0.4).setFill()
                 NSBezierPath(roundedRect: trackRect, xRadius: 1.5, yRadius: 1.5).fill()
 
-                // Fill based on time remaining (5h = 18000s total)
+                // Fill based on time remaining in the actual reported rate-limit window.
                 let remaining = max(0, resetDate.timeIntervalSince(Date()))
-                let totalWindow: TimeInterval = 5 * 3600
+                let totalWindow = resetWindowSeconds ?? 5 * 3600
                 let timePct = min(1.0, max(0, remaining / totalWindow))
                 let fillWidth = timeBarWidth * timePct
 
@@ -304,7 +308,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
-    private func drawCircleIcon(ctx: CGContext, size: CGFloat, sessionPercent: Int, weeklyPercent: Int, blocked: Bool) {
+    private func isSameWindow(_ lhs: UsageWindow, _ rhs: UsageWindow) -> Bool {
+        lhs.label == rhs.label &&
+        lhs.percent == rhs.percent &&
+        abs(lhs.reset.timeIntervalSince(rhs.reset)) < 1
+    }
+
+    private func drawCircleIcon(ctx: CGContext, size: CGFloat, sessionPercent: Int, weeklyPercent: Int?, blocked: Bool) {
         let center = CGPoint(x: size / 2, y: size / 2)
         let outerRadius: CGFloat = size / 2 - 1
         let ringWidth: CGFloat = 2.5
@@ -330,9 +340,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ctx.strokePath()
         }
 
-        // Inner circle
-        let innerRadius: CGFloat = size / 2 - ringWidth - 2
-        if innerRadius > 1 {
+        // Inner circle only appears when Codex/Claude reports a distinct secondary window.
+        if let weeklyPercent {
+            let innerRadius: CGFloat = size / 2 - ringWidth - 2
+            guard innerRadius > 1 else { return }
             ctx.setFillColor(NSColor.tertiaryLabelColor.withAlphaComponent(0.3).cgColor)
             ctx.fillEllipse(in: CGRect(
                 x: center.x - innerRadius, y: center.y - innerRadius,

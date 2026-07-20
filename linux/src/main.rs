@@ -257,11 +257,18 @@ fn parse_codex_line(line: &str, source: &str) -> Option<UsageData> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let limits = value.get("payload")?.get("rate_limits")?;
     let primary = limits.get("primary")?;
-    let secondary = limits.get("secondary")?;
     let primary_used = primary.get("used_percent")?.as_f64()? as f32;
     let primary_reset = primary.get("resets_at")?.as_i64()?;
-    let secondary_used = secondary.get("used_percent")?.as_f64()? as f32;
-    let secondary_reset = secondary.get("resets_at")?.as_i64()?;
+    let secondary = limits.get("secondary").filter(|v| !v.is_null());
+    let secondary_used = secondary
+        .and_then(|v| v.get("used_percent"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(primary_used);
+    let secondary_reset = secondary
+        .and_then(|v| v.get("resets_at"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(primary_reset);
     let reached_type = limits.get("rate_limit_reached_type").and_then(|v| v.as_str());
     let plan = limits.get("plan_type").and_then(|v| v.as_str()).unwrap_or("unknown");
 
