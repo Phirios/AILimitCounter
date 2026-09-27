@@ -35,7 +35,7 @@ PlasmoidItem {
     }
 
     function relativeTime(timestamp) {
-        const seconds = Math.max(0, Math.floor(timestamp - Date.now() / 1000))
+        const seconds = Math.max(0, Math.floor(timestamp - root.nowSeconds))
         const hours = Math.floor(seconds / 3600)
         const minutes = Math.floor((seconds % 3600) / 60)
         return hours > 0 ? "in " + hours + "h " + minutes + "m" : "in " + minutes + "m"
