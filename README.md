@@ -168,6 +168,22 @@ EOF
 
 Then add **AI Limit Counter** to your Plasma panel from **Enter Edit Mode → Add Widgets**.
 
+## Linux (GNOME)
+
+A native GNOME Shell extension (GNOME 49) lives in `gnome/`. It's independent of the KDE build and needs no compiled backend. A ring and the 5-hour percentage sit in the top bar. Clicking it opens a translucent dark drop-down with **Claude | GPT** tabs, each showing the 5-hour and weekly windows.
+
+- **Claude:** reads the OAuth token Claude Code keeps in `~/.claude/.credentials.json` and makes the same ~10-token Haiku request as the other builds. It polls only while the Claude tab is selected (every 5 min, or every minute while `claude` is running) and when the menu opens.
+- **GPT (Codex):** reads the tail of the newest `~/.codex/sessions/**/*.jsonl`. This is local only, so it costs nothing. A window whose reset time has passed is shown as reset.
+
+```bash
+cd gnome
+./install.sh            # copies to ~/.local/share/gnome-shell/extensions and compiles the schema
+# Wayland: log out and back in once, then:
+gnome-extensions enable ailimitcounter@firatege.github.io
+```
+
+Tests: `gjs -m gnome/tests/format.test.js`
+
 ## License
 
 MIT
