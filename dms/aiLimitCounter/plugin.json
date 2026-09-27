@@ -1,0 +1,13 @@
+{
+    "id": "aiLimitCounter",
+    "name": "AI Limit Counter",
+    "description": "Claude Code and Codex rate-limit usage in the bar",
+    "version": "1.0.0",
+    "author": "firatege",
+    "type": "widget",
+    "capabilities": ["dankbar-widget"],
+    "component": "./AiLimitWidget.qml",
+    "icon": "data_usage",
+    "settings": "./AiLimitSettings.qml",
+    "permissions": ["settings_read", "settings_write"]
+}

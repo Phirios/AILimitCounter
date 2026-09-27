@@ -6,7 +6,7 @@
 
 <p align="center">
   A native system tray app that displays your AI CLI rate limit usage in real time.
-  <br>Available for <strong>macOS</strong> (Swift/AppKit) and <strong>Linux</strong> (Rust/KDE Plasma).
+  <br>Available for <strong>macOS</strong> (Swift/AppKit) and <strong>Linux</strong> (Rust/KDE Plasma, GNOME, niri/DankMaterialShell).
 </p>
 
 <p align="center">
@@ -183,6 +183,24 @@ gnome-extensions enable ailimitcounter@firatege.github.io
 ```
 
 Tests: `gjs -m gnome/tests/format.test.js`
+
+## Linux (niri / DankMaterialShell)
+
+A [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar plugin lives in `dms/`, for niri and the other compositors DMS runs on. It shows a ring and the 5-hour percentage in the bar. Clicking it opens a panel with **Claude | GPT** tabs, each showing the 5-hour and weekly windows, a plan badge, a live indicator and a refresh button.
+
+The plugin gets its numbers from the Rust helper in `linux/` (`ai-limit-counter --json <provider>`), so it shares its data sources with the KDE build:
+
+- **Claude:** reads the OAuth token Claude Code keeps in `~/.claude/.credentials.json` (the `~/.claude/claude-menubar-token` file still works as a fallback). It polls only while Claude is the selected provider: every 5 min, or every minute while `claude` is running.
+- **GPT (Codex):** reads the newest `~/.codex/sessions/**/*.jsonl`. This is local only, so it is refreshed every minute. A window whose reset time has passed is shown as reset.
+
+```bash
+cd dms
+./install.sh            # builds the helper into ~/.local/bin and copies the plugin to ~/.config/DankMaterialShell/plugins
+```
+
+Then in DMS open **Settings → Plugins → Scan**, enable **AI Limit Counter** and add it to the bar. The provider and the helper path can be changed in the plugin settings.
+
+Tests: `node --test dms/tests/format.test.js` and `cargo test --manifest-path linux/Cargo.toml`
 
 ## License
 
