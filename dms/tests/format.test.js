@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {test} = require('node:test');
 
-const NAMES = ['levelFor', 'formatReset', 'formatAge', 'parseUsage', 'isClaudeDue', 'expandHome'];
+const NAMES = ['levelFor', 'formatReset', 'formatAge', 'parseUsage', 'isClaudeDue', 'expandHome', 'mayRefresh'];
 const source = fs
     .readFileSync(path.join(__dirname, '../aiLimitCounter/format.js'), 'utf8')
     .replace(/^\.pragma library$/m, '');
@@ -92,4 +92,16 @@ test('leaves absolute paths and other tildes alone', () => {
     assert.equal(Format.expandHome('/usr/bin/helper', '/home/me'), '/usr/bin/helper');
     assert.equal(Format.expandHome('~other/helper', '/home/me'), '~other/helper');
     assert.equal(Format.expandHome('', '/home/me'), '');
+});
+
+test('holds back refreshes that come too soon after the last one', () => {
+    assert.equal(Format.mayRefresh('claude', NOW - 59, NOW, false), false);
+    assert.equal(Format.mayRefresh('claude', NOW - 60, NOW, false), true);
+    assert.equal(Format.mayRefresh('codex', NOW - 4, NOW, false), false);
+    assert.equal(Format.mayRefresh('codex', NOW - 5, NOW, false), true);
+});
+
+test('a manual refresh is never held back', () => {
+    assert.equal(Format.mayRefresh('claude', NOW, NOW, true), true);
+    assert.equal(Format.mayRefresh('codex', NOW, NOW, true), true);
 });

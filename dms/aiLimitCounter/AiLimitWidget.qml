@@ -1,32 +1,21 @@
 import QtQuick
 import Quickshell
-import Quickshell.Io
 import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
 import "format.js" as Format
 
-// Bar pill (ring + percentage) and drop-down panel; owns the refresh schedule and per-provider state.
+// Bar pill (ring + percentage) and drop-down panel. State and polling live in LimitService.
 PluginComponent {
     id: root
 
-    readonly property var providers: [
-        {id: "claude", label: "Claude", title: "Claude Code"},
-        {id: "codex", label: "GPT", title: "Codex (ChatGPT)"}
-    ]
+    readonly property var providers: LimitService.providers
     readonly property string provider: pluginData.provider === "codex" ? "codex" : "claude"
     readonly property string helperPath: Format.expandHome(pluginData.helperPath || "~/.local/bin/ai-limit-counter", Quickshell.env("HOME"))
 
-    readonly property int tickSecs: 60
-    /** A forced refresh aside, Claude is never asked more often than this. */
-    readonly property int claudeMinAgeSecs: 60
-    readonly property var emptyEntry: ({usage: null, error: null, live: false, fetchedAt: 0})
-
-    property var entries: ({claude: emptyEntry, codex: emptyEntry})
-    property int now: nowSecs()
-
-    readonly property var entry: entries[provider]
-    readonly property bool loading: processFor(provider).busy
+    readonly property var entry: LimitService.entries[provider]
+    readonly property bool loading: LimitService.loading
+    readonly property int now: LimitService.now
     // Typed as colors (not strings) so Theme.withAlpha can read their channels.
     readonly property color claudeAccent: "#d97757"
     readonly property color codexAccent: Theme.isLightMode ? "#1b1b1f" : "#f4f4f6"
@@ -35,10 +24,6 @@ PluginComponent {
     readonly property color criticalColor: "#f87171"
     readonly property color idleColor: "#9e9ea8"
     readonly property string pillText: entry.usage ? entry.usage.fiveHour.pct + "%" : entry.error ? "!" : "…"
-
-    function nowSecs() {
-        return Math.floor(Date.now() / 1000);
-    }
 
     function accentFor(id) {
         return id === "claude" ? claudeAccent : codexAccent;
@@ -54,152 +39,16 @@ PluginComponent {
         return Format.levelFor(usageWindow.pct) === "crit" ? criticalColor : accentFor(provider);
     }
 
-    function processFor(id) {
-        return id === "claude" ? claudeProcess : codexProcess;
-    }
-
-    function updateEntry(id, changes) {
-        const next = Object.assign({}, entries);
-        next[id] = Object.assign({}, entries[id], changes);
-        entries = next;
-    }
-
     function selectProvider(id) {
         if (id === provider || !pluginService)
             return;
         pluginService.savePluginData(pluginId, "provider", id);
     }
 
-    function refresh(id, force) {
-        if (id === "claude" && !force && nowSecs() - entries.claude.fetchedAt < claudeMinAgeSecs)
-            return;
-        processFor(id).start();
-    }
-
-    function refreshAll() {
-        now = nowSecs();
-        for (const item of providers)
-            refresh(item.id, false);
-    }
-
-    function applyReport(id, text) {
-        const report = Format.parseUsage(text);
-        const changes = {error: report.error, fetchedAt: nowSecs()};
-        // Keep the last good numbers on screen when a refresh fails.
-        if (report.usage)
-            changes.usage = report.usage;
-        updateEntry(id, changes);
-    }
-
-    function reportMissingHelper(id) {
-        updateEntry(id, {
-            error: "Helper not found at " + helperPath + " — run dms/install.sh",
-            fetchedAt: nowSecs()
-        });
-    }
-
-    function applyLiveness(text) {
-        const running = text.split("\n");
-        for (const item of providers)
-            updateEntry(item.id, {live: running.indexOf(item.id) !== -1});
-    }
-
-    function tick() {
-        now = nowSecs();
-        if (!livenessProcess.running)
-            livenessProcess.running = true;
-
-        // Codex reads local files only, so it is always cheap to refresh.
-        refresh("codex", false);
-        if (provider === "claude" && Format.isClaudeDue(entries.claude.fetchedAt, now, entries.claude.live))
-            refresh("claude", false);
-    }
-
-    onProviderChanged: refresh(provider, false)
-
-    Timer {
-        interval: root.tickSecs * 1000
-        repeat: true
-        running: true
-        triggeredOnStart: true
-        onTriggered: root.tick()
-    }
-
-    // One helper run. Exit and end-of-output arrive in no fixed order, so a run is only
-    // finished once both were seen; `busy` keeps a second run from starting in between.
-    component HelperProcess: Process {
-        id: helper
-
-        property bool busy: false
-        property bool wasStarted: false
-        property bool exitSeen: false
-        property bool outputSeen: false
-
-        signal reported(string text)
-        signal startFailed
-
-        function start() {
-            if (busy)
-                return;
-            busy = true;
-            wasStarted = false;
-            exitSeen = false;
-            outputSeen = false;
-            running = true;
-        }
-
-        function finishIfDone() {
-            if (!busy || !exitSeen || !outputSeen)
-                return;
-            busy = false;
-            reported(stdout.text);
-        }
-
-        stdout: StdioCollector {
-            onStreamFinished: {
-                helper.outputSeen = true;
-                helper.finishIfDone();
-            }
-        }
-        onStarted: wasStarted = true
-        onExited: {
-            exitSeen = true;
-            finishIfDone();
-        }
-        // A binary that cannot be started never exits or reports; it only stops "running".
-        onRunningChanged: {
-            if (running || !busy || wasStarted)
-                return;
-            busy = false;
-            startFailed();
-        }
-    }
-
-    HelperProcess {
-        id: claudeProcess
-
-        command: [root.helperPath, "--json", "claude"]
-        onReported: text => root.applyReport("claude", text)
-        onStartFailed: root.reportMissingHelper("claude")
-    }
-
-    HelperProcess {
-        id: codexProcess
-
-        command: [root.helperPath, "--json", "codex"]
-        onReported: text => root.applyReport("codex", text)
-        onStartFailed: root.reportMissingHelper("codex")
-    }
-
-    // Exact name match, so paths and arguments containing "claude" don't count.
-    Process {
-        id: livenessProcess
-
-        command: ["sh", "-c", "for name in claude codex; do pgrep -x \"$name\" >/dev/null && echo \"$name\"; done; true"]
-        stdout: StdioCollector {
-            onStreamFinished: root.applyLiveness(text)
-        }
-    }
+    onProviderChanged: LimitService.provider = provider
+    onHelperPathChanged: LimitService.helperPath = helperPath
+    Component.onCompleted: LimitService.attach(provider, helperPath)
+    Component.onDestruction: LimitService.detach()
 
     component LiveDot: Rectangle {
         id: dot
@@ -295,7 +144,7 @@ PluginComponent {
             padding: Theme.spacingS
             spacing: Theme.spacingM + 2
 
-            Component.onCompleted: root.refreshAll()
+            Component.onCompleted: LimitService.refreshAll()
 
             // Provider tabs (segmented control)
             Rectangle {
@@ -506,8 +355,8 @@ PluginComponent {
                     border.color: Theme.withAlpha(Theme.surfaceText, 0.35)
                     activeFocusOnTab: true
 
-                    Keys.onReturnPressed: root.refresh(root.provider, true)
-                    Keys.onSpacePressed: root.refresh(root.provider, true)
+                    Keys.onReturnPressed: LimitService.refresh(root.provider, true)
+                    Keys.onSpacePressed: LimitService.refresh(root.provider, true)
 
                     DankIcon {
                         id: refreshIcon
@@ -537,10 +386,7 @@ PluginComponent {
                         hoverEnabled: true
                         enabled: !root.loading
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            root.now = root.nowSecs();
-                            root.refresh(root.provider, true);
-                        }
+                        onClicked: LimitService.refresh(root.provider, true)
                     }
                 }
             }

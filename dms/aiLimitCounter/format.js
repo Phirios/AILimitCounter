@@ -80,6 +80,13 @@ function expandHome(path, home) {
     return trimmed.indexOf("~/") === 0 ? home + trimmed.slice(1) : trimmed;
 }
 
+/** Shortest gap between two automatic refreshes; Codex only reads local files, so it may go faster. */
+var MIN_REFRESH_AGE_SECS = {claude: 60, codex: 5};
+
+function mayRefresh(id, fetchedAt, now, force) {
+    return force || now - fetchedAt >= (MIN_REFRESH_AGE_SECS[id] || 0);
+}
+
 function isClaudeDue(fetchedAt, now, live) {
     var interval = live ? CLAUDE_LIVE_INTERVAL_SECS : CLAUDE_IDLE_INTERVAL_SECS;
     return now - fetchedAt >= interval;
