@@ -163,12 +163,28 @@ struct UsageData {
     claim: String,
     status: String,
     source: String,
+    plan: String,
     fetched_at: i64,
+    /// When the numbers were produced, which for Codex is older than when we read them.
+    data_at: i64,
+}
+
+fn with_data_time(usage: UsageData, produced: SystemTime) -> UsageData {
+    let data_at = produced
+        .duration_since(UNIX_EPOCH)
+        .map(|age| age.as_secs() as i64)
+        .unwrap_or(usage.fetched_at);
+    UsageData { data_at, ..usage }
+}
+
+/// A window whose reset time has passed has been refilled, whatever the last report said.
+fn window_pct(util: f32, reset_at: i64, now: i64) -> i32 {
+    if reset_at <= now { 0 } else { (util * 100.0) as i32 }
 }
 
 impl UsageData {
-    fn five_h_pct(&self) -> i32 { (self.five_h_util * 100.0) as i32 }
-    fn seven_d_pct(&self) -> i32 { (self.seven_d_util * 100.0) as i32 }
+    fn five_h_pct(&self) -> i32 { window_pct(self.five_h_util, self.five_h_reset, self.fetched_at) }
+    fn seven_d_pct(&self) -> i32 { window_pct(self.seven_d_util, self.seven_d_reset, self.fetched_at) }
     fn overage_pct(&self) -> i32 { (self.overage_util * 100.0) as i32 }
 }
 
@@ -179,11 +195,62 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn get_claude_token() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home).join(".claude/claude-menubar-token");
-    let t = std::fs::read_to_string(path).ok()?.trim().to_owned();
-    if t.is_empty() { None } else { Some(t) }
+#[derive(Debug, Clone)]
+struct ClaudeCredentials {
+    token: String,
+    plan: String,
+    /// OAuth tokens authenticate as a bearer token; the legacy token file is sent as an API key.
+    is_oauth: bool,
+}
+
+/// e.g. subscriptionType "max" + rateLimitTier "default_claude_max_5x" -> "max 5x".
+fn parse_credentials(text: &str) -> Option<ClaudeCredentials> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let oauth = value.get("claudeAiOauth")?;
+    let token = oauth.get("accessToken")?.as_str()?.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    let kind = oauth.get("subscriptionType").and_then(|v| v.as_str()).unwrap_or("");
+    let tier = oauth
+        .get("rateLimitTier")
+        .and_then(|v| v.as_str())
+        .and_then(|t| t.rsplit('_').next())
+        .filter(|t| {
+            t.strip_suffix('x')
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        })
+        .unwrap_or("");
+    let plan = [kind, tier]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Some(ClaudeCredentials { token: token.to_owned(), plan, is_oauth: true })
+}
+
+fn get_claude_credentials() -> Option<ClaudeCredentials> {
+    let claude_dir = PathBuf::from(std::env::var("HOME").ok()?).join(".claude");
+    if let Some(creds) = fs::read_to_string(claude_dir.join(".credentials.json"))
+        .ok()
+        .and_then(|text| parse_credentials(&text))
+    {
+        return Some(creds);
+    }
+
+    // Legacy plain-text token file written by the macOS/KDE install steps.
+    let token = fs::read_to_string(claude_dir.join("claude-menubar-token"))
+        .ok()?
+        .trim()
+        .to_owned();
+    if token.is_empty() {
+        None
+    } else {
+        Some(ClaudeCredentials { token, plan: String::new(), is_oauth: false })
+    }
 }
 
 fn hdr_f32(resp: &ureq::Response, key: &str) -> Option<f32> {
@@ -199,9 +266,9 @@ fn parse_headers(resp: &ureq::Response) -> Option<UsageData> {
     Some(UsageData {
         provider: Provider::Claude,
         five_h_util: hdr_f32(resp, "anthropic-ratelimit-unified-5h-utilization")?,
-        five_h_reset: hdr_i64(resp, "anthropic-ratelimit-unified-5h-reset").unwrap_or(now),
+        five_h_reset: hdr_i64(resp, "anthropic-ratelimit-unified-5h-reset").unwrap_or(now + 1),
         seven_d_util: hdr_f32(resp, "anthropic-ratelimit-unified-7d-utilization")?,
-        seven_d_reset: hdr_i64(resp, "anthropic-ratelimit-unified-7d-reset").unwrap_or(now),
+        seven_d_reset: hdr_i64(resp, "anthropic-ratelimit-unified-7d-reset").unwrap_or(now + 1),
         overage_util: hdr_f32(resp, "anthropic-ratelimit-unified-overage-utilization").unwrap_or(0.0),
         claim: resp
             .header("anthropic-ratelimit-unified-representative-claim")
@@ -212,22 +279,38 @@ fn parse_headers(resp: &ureq::Response) -> Option<UsageData> {
             .unwrap_or("unknown")
             .into(),
         source: "Anthropic rate-limit headers".into(),
+        plan: String::new(),
         fetched_at: now,
+        data_at: now,
     })
 }
 
-fn fetch_claude_usage(token: &str) -> Result<UsageData, String> {
+const HTTP_TIMEOUT_SECS: u64 = 20;
+
+fn fetch_claude_usage(creds: &ClaudeCredentials) -> Result<UsageData, String> {
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "."}]
     });
 
-    let result = ureq::post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", token)
+    // Never follow a redirect with the token attached.
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build();
+    let request = agent
+        .post("https://api.anthropic.com/v1/messages")
         .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
-        .send_json(body);
+        .set("content-type", "application/json");
+    let request = if creds.is_oauth {
+        request
+            .set("authorization", &format!("Bearer {}", creds.token))
+            .set("anthropic-beta", "oauth-2025-04-20")
+    } else {
+        request.set("x-api-key", &creds.token)
+    };
+    let result = request.send_json(body);
 
     let resp = match result {
         Ok(r) => r,
@@ -238,7 +321,8 @@ fn fetch_claude_usage(token: &str) -> Result<UsageData, String> {
         Err(e) => return Err(e.to_string()),
     };
 
-    parse_headers(&resp).ok_or_else(|| "Rate limit headers not found".into())
+    let usage = parse_headers(&resp).ok_or_else(|| "Rate limit headers not found".to_string())?;
+    Ok(UsageData { plan: creds.plan.clone(), ..usage })
 }
 
 fn collect_jsonl_files(dir: PathBuf, out: &mut Vec<(PathBuf, SystemTime)>) {
@@ -275,6 +359,7 @@ fn parse_codex_line(line: &str, source: &str) -> Option<UsageData> {
         .unwrap_or(primary_reset);
     let reached_type = limits.get("rate_limit_reached_type").and_then(|v| v.as_str());
     let plan = limits.get("plan_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let now = now_secs();
 
     Some(UsageData {
         provider: Provider::Codex,
@@ -286,7 +371,9 @@ fn parse_codex_line(line: &str, source: &str) -> Option<UsageData> {
         claim: if primary_used >= secondary_used { "five_hour" } else { "seven_day" }.into(),
         status: if reached_type.is_some() { "blocked" } else { "allowed" }.into(),
         source: format!("{} - latest Codex session log ({})", source, plan),
-        fetched_at: now_secs(),
+        plan: if plan == "unknown" { String::new() } else { plan.to_owned() },
+        fetched_at: now,
+        data_at: now,
     })
 }
 
@@ -296,12 +383,12 @@ fn fetch_codex_usage() -> Result<UsageData, String> {
     collect_jsonl_files(PathBuf::from(home).join(".codex/sessions"), &mut files);
     files.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for (path, _) in files {
+    for (path, modified) in files {
         let Ok(text) = fs::read_to_string(&path) else { continue };
         let source = path.file_name().and_then(|s| s.to_str()).unwrap_or("session");
         for line in text.lines().rev() {
             if let Some(usage) = parse_codex_line(line, source) {
-                return Ok(usage);
+                return Ok(with_data_time(usage, modified));
             }
         }
     }
@@ -311,8 +398,8 @@ fn fetch_codex_usage() -> Result<UsageData, String> {
 
 fn fetch_usage(provider: Provider) -> Result<UsageData, String> {
     match provider {
-        Provider::Claude => match get_claude_token() {
-            Some(t) => fetch_claude_usage(&t),
+        Provider::Claude => match get_claude_credentials() {
+            Some(creds) => fetch_claude_usage(&creds),
             None => Err("Token not found. Run: claude auth login".into()),
         },
         Provider::Codex => fetch_codex_usage(),
@@ -320,7 +407,7 @@ fn fetch_usage(provider: Provider) -> Result<UsageData, String> {
 }
 
 fn default_provider() -> Provider {
-    if get_claude_token().is_some() {
+    if get_claude_credentials().is_some() {
         Provider::Claude
     } else {
         Provider::Codex
@@ -337,7 +424,9 @@ fn usage_json(provider: Provider) -> serde_json::Value {
             "seven_d_reset": u.seven_d_reset,
             "status": u.status,
             "source": u.source,
+            "plan": u.plan,
             "fetched_at": u.fetched_at,
+            "data_at": u.data_at,
             "is_live": is_provider_running(provider),
             "error": null,
         }),
@@ -706,5 +795,64 @@ fn main() {
 
     loop {
         thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OAUTH_JSON: &str = r#"{"claudeAiOauth":{"accessToken":" tok-123 ","subscriptionType":"max","rateLimitTier":"default_claude_max_5x"}}"#;
+
+    #[test]
+    fn parses_token_and_plan_from_credentials_json() {
+        let creds = parse_credentials(OAUTH_JSON).expect("credentials");
+        assert_eq!(creds.token, "tok-123");
+        assert_eq!(creds.plan, "max 5x");
+        assert!(creds.is_oauth);
+    }
+
+    #[test]
+    fn plan_omits_tier_when_it_has_no_multiplier() {
+        let text = r#"{"claudeAiOauth":{"accessToken":"t","subscriptionType":"pro","rateLimitTier":"default_claude_ai"}}"#;
+        assert_eq!(parse_credentials(text).expect("credentials").plan, "pro");
+    }
+
+    #[test]
+    fn rejects_credentials_without_a_token() {
+        assert!(parse_credentials(r#"{"claudeAiOauth":{"accessToken":"  "}}"#).is_none());
+        assert!(parse_credentials(r#"{"other":{}}"#).is_none());
+        assert!(parse_credentials("not json").is_none());
+    }
+
+    #[test]
+    fn data_age_follows_the_session_log_not_the_time_it_was_read() {
+        let usage = parse_codex_line(CODEX_LINE, "session.jsonl").expect("usage");
+        let dated = with_data_time(usage.clone(), UNIX_EPOCH + Duration::from_secs(1_234));
+        assert_eq!(dated.data_at, 1_234);
+        assert_eq!(dated.fetched_at, usage.fetched_at);
+    }
+
+    #[test]
+    fn window_that_already_reset_reports_zero() {
+        assert_eq!(window_pct(0.94, 1_000, 1_000), 0);
+        assert_eq!(window_pct(0.94, 999, 1_000), 0);
+    }
+
+    #[test]
+    fn window_still_open_reports_its_utilization() {
+        assert_eq!(window_pct(0.94, 1_001, 1_000), 94);
+        assert_eq!(window_pct(0.0, 1_001, 1_000), 0);
+    }
+
+    const CODEX_LINE: &str = r#"{"payload":{"rate_limits":{"primary":{"used_percent":42.0,"resets_at":2000},"secondary":null,"plan_type":"plus"}}}"#;
+
+    #[test]
+    fn codex_line_carries_plan_and_single_window_fallback() {
+        let usage = parse_codex_line(CODEX_LINE, "session.jsonl").expect("usage");
+        assert_eq!(usage.plan, "plus");
+        assert_eq!(usage.seven_d_reset, 2000);
+        assert_eq!(usage.data_at, usage.fetched_at);
+        assert_eq!(window_pct(usage.five_h_util, usage.five_h_reset, 1_000), 42);
     }
 }
