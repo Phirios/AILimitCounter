@@ -1,0 +1,9 @@
+{
+  "uuid": "ailimitcounter@firatege.github.io",
+  "name": "AI Limit Counter",
+  "description": "Claude Code and Codex (GPT) 5-hour and weekly usage limits in the top bar.",
+  "shell-version": ["49"],
+  "settings-schema": "org.gnome.shell.extensions.ailimitcounter",
+  "url": "https://github.com/firatege/AILimitCounter",
+  "version-name": "1.0.0"
+}

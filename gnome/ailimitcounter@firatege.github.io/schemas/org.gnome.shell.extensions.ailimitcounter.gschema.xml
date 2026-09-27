@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.ailimitcounter" path="/org/gnome/shell/extensions/ailimitcounter/">
+    <key name="provider" type="s">
+      <choices>
+        <choice value="claude"/>
+        <choice value="codex"/>
+      </choices>
+      <default>'claude'</default>
+      <summary>Selected provider</summary>
+      <description>Which AI CLI's limits are shown in the top bar.</description>
+    </key>
+  </schema>
+</schemalist>
