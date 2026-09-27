@@ -200,6 +200,8 @@ cd dms
 
 Then in DMS open **Settings → Plugins → Scan**, enable **AI Limit Counter** and add it to the bar. The provider and the helper path can be changed in the plugin settings.
 
+Building the helper needs `cargo`, `dbus-devel` and `pkgconf-pkg-config` (Fedora package names).
+
 Tests: `node --test dms/tests/format.test.js` and `cargo test --manifest-path linux/Cargo.toml`
 
 ## License
