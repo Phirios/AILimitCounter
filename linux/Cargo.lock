@@ -9,6 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "ai-limit-counter"
+version = "1.2.0"
+dependencies = [
+ "ksni",
+ "serde_json",
+ "tiny-skia",
+ "ureq",
+]
+
+[[package]]
 name = "ansi_term"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -87,16 +97,6 @@ dependencies = [
  "textwrap",
  "unicode-width",
  "vec_map",
-]
-
-[[package]]
-name = "ai-limit-counter"
-version = "1.2.0"
-dependencies = [
- "ksni",
- "serde_json",
- "tiny-skia",
- "ureq",
 ]
 
 [[package]]
@@ -676,6 +676,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]

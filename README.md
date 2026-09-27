@@ -118,7 +118,7 @@ Click to open:
 
 ## Linux (KDE Plasma)
 
-Pure Rust implementation using [ksni](https://github.com/iovxw/ksni) (StatusNotifierItem) and [tiny-skia](https://github.com/RazrFalcon/tiny-skia). No GTK or libappindicator dependency — works on both X11 and Wayland.
+The Linux version combines a Rust backend with a native Plasma 6 panel widget. The widget displays the circular limits, current percentage, remaining 5-hour time bar, and live indicator directly in the panel on both X11 and Wayland.
 
 ### Install dependencies (Arch / CachyOS)
 
@@ -135,6 +135,13 @@ cargo build --release
 
 Binary: `linux/target/release/ai-limit-counter`
 
+Install the backend and Plasma widget:
+
+```bash
+install -Dm755 target/release/ai-limit-counter ~/.local/bin/ai-limit-counter
+kpackagetool6 --type Plasma/Applet --install plasmoid
+```
+
 ### Token setup (one-time)
 
 ```bash
@@ -145,7 +152,7 @@ security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | \
 
 Or copy from your Mac's `~/.claude/claude-menubar-token`.
 
-### Autostart with KDE
+### Autostart the backend with KDE
 
 ```bash
 mkdir -p ~/.config/autostart
@@ -153,11 +160,13 @@ cat > ~/.config/autostart/ai-limit-counter.desktop << 'EOF'
 [Desktop Entry]
 Type=Application
 Name=AILimitCounter
-Exec=/path/to/ai-limit-counter
-Comment=Claude Code rate limit monitor
+Exec=/home/YOUR_USER/.local/bin/ai-limit-counter --server
+Comment=AI CLI rate limit monitor
 X-KDE-autostart-phase=2
 EOF
 ```
+
+Then add **AI Limit Counter** to your Plasma panel from **Enter Edit Mode → Add Widgets**.
 
 ## License
 

@@ -1,5 +1,7 @@
 use std::{
     fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -86,11 +88,13 @@ fn render_icon(session_pct: i32, weekly_pct: i32, blocked: bool, pulse: f32) -> 
 
         if let Some(rect) = Rect::from_xywh(CX - INNER_R, fill_top, INNER_R * 2.0, fill_h + 0.5) {
             let fill_path = PathBuilder::from_rect(rect);
-            let mut clip = ClipMask::new();
-            if clip
-                .set_path(S, S, &inner_circle, FillRule::Winding, true)
-                .is_some()
-            {
+            if let Some(mut clip) = Mask::new(S, S) {
+                clip.fill_path(
+                    &inner_circle,
+                    FillRule::Winding,
+                    true,
+                    Transform::identity(),
+                );
                 paint.set_color_rgba8(r, g, b, 195);
                 pm.fill_path(&fill_path, &paint, FillRule::Winding, Transform::identity(), Some(&clip));
             }
@@ -315,6 +319,64 @@ fn fetch_usage(provider: Provider) -> Result<UsageData, String> {
     }
 }
 
+fn default_provider() -> Provider {
+    if get_claude_token().is_some() {
+        Provider::Claude
+    } else {
+        Provider::Codex
+    }
+}
+
+fn usage_json(provider: Provider) -> serde_json::Value {
+    match fetch_usage(provider) {
+        Ok(u) => serde_json::json!({
+            "provider": u.provider.name(),
+            "five_h_pct": u.five_h_pct(),
+            "five_h_reset": u.five_h_reset,
+            "seven_d_pct": u.seven_d_pct(),
+            "seven_d_reset": u.seven_d_reset,
+            "status": u.status,
+            "source": u.source,
+            "fetched_at": u.fetched_at,
+            "is_live": is_provider_running(provider),
+            "error": null,
+        }),
+        Err(error) => serde_json::json!({
+            "provider": provider.name(),
+            "is_live": is_provider_running(provider),
+            "error": error,
+        }),
+    }
+}
+
+fn print_usage_json(provider: Provider) {
+    println!("{}", usage_json(provider));
+}
+
+fn serve_connection(mut stream: TcpStream, provider: Provider) {
+    let mut request = [0u8; 2048];
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    if stream.read(&mut request).is_err() {
+        return;
+    }
+
+    let body = usage_json(provider).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn run_status_server(provider: Provider) -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:38465")?;
+    for stream in listener.incoming().flatten() {
+        serve_connection(stream, provider);
+    }
+    Ok(())
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn bar(pct: i32) -> String {
@@ -369,7 +431,12 @@ impl ksni::Tray for ClaudeTray {
 
     fn title(&self) -> String {
         match &self.usage {
-            Some(u) => format!("Claude {}%/{}%", u.five_h_pct(), u.seven_d_pct()),
+            Some(u) => format!(
+                "{} {}%/{}%",
+                u.provider.name(),
+                u.five_h_pct(),
+                u.seven_d_pct()
+            ),
             None => format!("{} MenuBar", self.provider.name()),
         }
     }
@@ -530,11 +597,30 @@ fn fetch_and_update(handle: &ksni::Handle<ClaudeTray>, provider: Provider) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--json") {
+        let provider = match args.get(2).map(String::as_str) {
+            Some("claude") => Provider::Claude,
+            Some("codex") => Provider::Codex,
+            _ => default_provider(),
+        };
+        print_usage_json(provider);
+        return;
+    }
+    if args.get(1).is_some_and(|arg| arg == "--server") {
+        if let Err(error) = run_status_server(default_provider()) {
+            eprintln!("AI Limit Counter status server failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let (refresh_tx, refresh_rx) = mpsc::sync_channel::<()>(1);
-    let provider_state = Arc::new(Mutex::new(Provider::Claude));
+    let initial_provider = default_provider();
+    let provider_state = Arc::new(Mutex::new(initial_provider));
 
     let service = ksni::TrayService::new(ClaudeTray {
-        provider: Provider::Claude,
+        provider: initial_provider,
         usage: None,
         error: None,
         is_live: false,
@@ -565,9 +651,14 @@ fn main() {
         let provider_state = Arc::clone(&provider_state);
         thread::spawn(move || loop {
             let secs = if live_flag.load(Ordering::Relaxed) { 60 } else { 300 };
-            let provider = provider_state.lock().map(|p| *p).unwrap_or(Provider::Claude);
             match refresh_rx.recv_timeout(Duration::from_secs(secs)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => fetch_and_update(&h, provider),
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let provider = provider_state
+                        .lock()
+                        .map(|p| *p)
+                        .unwrap_or(Provider::Claude);
+                    fetch_and_update(&h, provider);
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         });
