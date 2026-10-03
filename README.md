@@ -1,5 +1,7 @@
 # AILimitCounter
 
+[![CI](https://github.com/Phirios/AILimitCounter/actions/workflows/ci.yml/badge.svg)](https://github.com/Phirios/AILimitCounter/actions/workflows/ci.yml)
+
 <p align="center">
   <img src="assets/icon.png" width="128" alt="AILimitCounter Icon">
 </p>
@@ -203,6 +205,10 @@ Then in DMS open **Settings → Plugins → Scan**, enable **AI Limit Counter** 
 Building the helper needs `cargo`, `dbus-devel` and `pkgconf-pkg-config` (Fedora package names).
 
 Tests: `node --test dms/tests/format.test.js` and `cargo test --manifest-path linux/Cargo.toml`
+
+GitHub Actions runs the Rust tests and release build, DMS and GNOME formatting tests,
+GNOME schema validation, installer syntax checks, and a macOS Swift release build on
+every push and pull request. It can also be run manually from the Actions tab.
 
 ## License
 
