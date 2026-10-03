@@ -1,8 +1,9 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -165,16 +166,8 @@ struct UsageData {
     source: String,
     plan: String,
     fetched_at: i64,
-    /// When the numbers were produced, which for Codex is older than when we read them.
+    /// When the usage report was fetched from the provider.
     data_at: i64,
-}
-
-fn with_data_time(usage: UsageData, produced: SystemTime) -> UsageData {
-    let data_at = produced
-        .duration_since(UNIX_EPOCH)
-        .map(|age| age.as_secs() as i64)
-        .unwrap_or(usage.fetched_at);
-    UsageData { data_at, ..usage }
 }
 
 /// A window whose reset time has passed has been refilled, whatever the last report said.
@@ -325,43 +318,28 @@ fn fetch_claude_usage(creds: &ClaudeCredentials) -> Result<UsageData, String> {
     Ok(UsageData { plan: creds.plan.clone(), ..usage })
 }
 
-fn collect_jsonl_files(dir: PathBuf, out: &mut Vec<(PathBuf, SystemTime)>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files(path, out);
-        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            out.push((path, modified));
-        }
-    }
-}
-
-fn parse_codex_line(line: &str, source: &str) -> Option<UsageData> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let limits = value.get("payload")?.get("rate_limits")?;
-    let primary = limits.get("primary")?;
-    let primary_used = primary.get("used_percent")?.as_f64()? as f32;
-    let primary_reset = primary.get("resets_at")?.as_i64()?;
+/// Select only the ordinary Codex quota for the account resolved by Codex itself.
+fn parse_codex_limits(result: &serde_json::Value) -> Result<UsageData, String> {
+    let limits = if let Some(buckets) = result.get("rateLimitsByLimitId").filter(|v| !v.is_null()) {
+        buckets.get("codex")
+    } else {
+        result.get("rateLimits").filter(|v| {
+            v.get("limitId").and_then(|id| id.as_str()).is_none_or(|id| id == "codex")
+        })
+    }.ok_or("Default Codex account has no ordinary Codex quota")?;
+    let primary = limits.get("primary").ok_or("Codex returned no primary quota")?;
+    let primary_used = primary.get("usedPercent").and_then(|v| v.as_f64())
+        .ok_or("Codex returned invalid quota usage")? as f32;
+    let primary_reset = primary.get("resetsAt").and_then(|v| v.as_i64())
+        .ok_or("Codex returned invalid quota reset")?;
     let secondary = limits.get("secondary").filter(|v| !v.is_null());
-    let secondary_used = secondary
-        .and_then(|v| v.get("used_percent"))
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .unwrap_or(primary_used);
-    let secondary_reset = secondary
-        .and_then(|v| v.get("resets_at"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(primary_reset);
-    let reached_type = limits.get("rate_limit_reached_type").and_then(|v| v.as_str());
-    let plan = limits.get("plan_type").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let secondary_used = secondary.and_then(|v| v.get("usedPercent"))
+        .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let secondary_reset = secondary.and_then(|v| v.get("resetsAt"))
+        .and_then(|v| v.as_i64()).unwrap_or(0);
+    let reached = limits.get("rateLimitReachedType").is_some_and(|v| !v.is_null());
     let now = now_secs();
-
-    Some(UsageData {
+    Ok(UsageData {
         provider: Provider::Codex,
         five_h_util: primary_used / 100.0,
         five_h_reset: primary_reset,
@@ -369,31 +347,79 @@ fn parse_codex_line(line: &str, source: &str) -> Option<UsageData> {
         seven_d_reset: secondary_reset,
         overage_util: 0.0,
         claim: if primary_used >= secondary_used { "five_hour" } else { "seven_day" }.into(),
-        status: if reached_type.is_some() { "blocked" } else { "allowed" }.into(),
-        source: format!("{} - latest Codex session log ({})", source, plan),
-        plan: if plan == "unknown" { String::new() } else { plan.to_owned() },
+        status: if reached { "blocked" } else { "allowed" }.into(),
+        source: "Codex default account — account/rateLimits/read (codex quota)".into(),
+        plan: limits.get("planType").and_then(|v| v.as_str()).unwrap_or("").into(),
         fetched_at: now,
         data_at: now,
     })
 }
 
-fn fetch_codex_usage() -> Result<UsageData, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    let mut files = Vec::new();
-    collect_jsonl_files(PathBuf::from(home).join(".codex/sessions"), &mut files);
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+fn read_codex_rpc(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let id = request["id"].clone();
+    writeln!(input, "{}", request).and_then(|_| input.flush())
+        .map_err(|_| "Could not send Codex quota request".to_string())?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if output.read_line(&mut line).map_err(|_| "Could not read Codex response")? == 0 {
+            return Err("Codex closed the quota connection".into());
+        }
+        let Ok(response) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if response.get("id") != Some(&id) { continue; }
+        // Do not expose raw RPC errors, which may contain account details.
+        return response.get("result").cloned()
+            .ok_or("Codex quota request failed — check the default Codex login".into());
+    }
+}
 
-    for (path, modified) in files {
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        let source = path.file_name().and_then(|s| s.to_str()).unwrap_or("session");
-        for line in text.lines().rev() {
-            if let Some(usage) = parse_codex_line(line, source) {
-                return Ok(with_data_time(usage, modified));
+fn fetch_codex_usage() -> Result<UsageData, String> {
+    // Codex resolves CODEX_HOME, its credential store and default account. No session
+    // logs or credentials are read by this helper, and no inference turn is started.
+    let spawn = |executable: PathBuf| {
+        Command::new(executable).args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    };
+    // Desktop shells may omit ~/.local/bin from PATH, even when the CLI is installed there.
+    // Keep PATH's selected Codex first so the user's CLI/account configuration is respected.
+    let mut child = spawn(PathBuf::from("codex")).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            if let Some(home) = std::env::var_os("HOME") {
+                return spawn(PathBuf::from(home).join(".local/bin/codex"));
             }
         }
-    }
-
-    Err("No Codex rate-limit events found yet".into())
+        Err(error)
+    }).map_err(|_| "Could not start codex — install it on PATH or in ~/.local/bin".to_string())?;
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let result = (|| {
+            read_codex_rpc(&mut input, &mut output, serde_json::json!({
+                "id": 1, "method": "initialize", "params": {
+                    "clientInfo": {"name": "ai_limit_counter", "version": env!("CARGO_PKG_VERSION")}
+                }
+            }))?;
+            writeln!(input, "{}", serde_json::json!({"method": "initialized"}))
+                .map_err(|_| "Could not initialize Codex quota connection".to_string())?;
+            let result = read_codex_rpc(&mut input, &mut output, serde_json::json!({
+                "id": 2, "method": "account/rateLimits/read"
+            }))?;
+            parse_codex_limits(&result)
+        })();
+        let _ = tx.send(result);
+    });
+    let result = rx.recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|_| Err("Codex quota request timed out".into()));
+    // Also unblock the reader on a timeout and reap the child on every exit path.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    result
 }
 
 fn fetch_usage(provider: Provider) -> Result<UsageData, String> {
@@ -826,14 +852,6 @@ mod tests {
     }
 
     #[test]
-    fn data_age_follows_the_session_log_not_the_time_it_was_read() {
-        let usage = parse_codex_line(CODEX_LINE, "session.jsonl").expect("usage");
-        let dated = with_data_time(usage.clone(), UNIX_EPOCH + Duration::from_secs(1_234));
-        assert_eq!(dated.data_at, 1_234);
-        assert_eq!(dated.fetched_at, usage.fetched_at);
-    }
-
-    #[test]
     fn window_that_already_reset_reports_zero() {
         assert_eq!(window_pct(0.94, 1_000, 1_000), 0);
         assert_eq!(window_pct(0.94, 999, 1_000), 0);
@@ -845,14 +863,48 @@ mod tests {
         assert_eq!(window_pct(0.0, 1_001, 1_000), 0);
     }
 
-    const CODEX_LINE: &str = r#"{"payload":{"rate_limits":{"primary":{"used_percent":42.0,"resets_at":2000},"secondary":null,"plan_type":"plus"}}}"#;
+    fn quota(id: &str, used: i32) -> serde_json::Value {
+        serde_json::json!({"limitId": id, "primary": {"usedPercent": used, "resetsAt": 2000},
+            "secondary": {"usedPercent": 14, "resetsAt": 9000}, "planType": "plus"})
+    }
 
     #[test]
-    fn codex_line_carries_plan_and_single_window_fallback() {
-        let usage = parse_codex_line(CODEX_LINE, "session.jsonl").expect("usage");
+    fn ordinary_quota_wins_over_reserve_and_legacy_bucket() {
+        let result = serde_json::json!({"rateLimits": quota("base_model_inference", 0),
+            "rateLimitsByLimitId": {"base_model_inference": quota("base_model_inference", 0),
+                "codex": quota("codex", 88)}});
+        let usage = parse_codex_limits(&result).unwrap();
+        assert_eq!(window_pct(usage.five_h_util, usage.five_h_reset, 1000), 88);
+        assert_eq!(window_pct(usage.seven_d_util, usage.seven_d_reset, 1000), 14);
         assert_eq!(usage.plan, "plus");
-        assert_eq!(usage.seven_d_reset, 2000);
         assert_eq!(usage.data_at, usage.fetched_at);
-        assert_eq!(window_pct(usage.five_h_util, usage.five_h_reset, 1_000), 42);
+        assert_eq!(usage.status, "allowed");
+    }
+
+    #[test]
+    fn reserve_only_response_is_not_a_codex_quota() {
+        let reserve = quota("base_model_inference", 0);
+        assert!(parse_codex_limits(&serde_json::json!({"rateLimits": reserve})).is_err());
+        assert!(parse_codex_limits(&serde_json::json!({"rateLimits": quota("codex", 88),
+            "rateLimitsByLimitId": {"base_model_inference": reserve}})).is_err());
+    }
+
+    #[test]
+    fn legacy_response_and_blocked_status_are_supported() {
+        let mut limits = quota("codex", 100);
+        limits["rateLimitReachedType"] = serde_json::json!("primary");
+        let usage = parse_codex_limits(&serde_json::json!({"rateLimits": limits})).unwrap();
+        assert_eq!(usage.status, "blocked");
+        assert!(parse_codex_limits(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn rpc_ignores_notifications_and_unrelated_responses() {
+        let mut input = Vec::new();
+        let mut output = std::io::Cursor::new(
+            b"{\"method\":\"account/updated\"}\n{\"id\":7,\"result\":{}}\n{\"id\":2,\"result\":{\"ok\":true}}\n");
+        let result = read_codex_rpc(&mut input, &mut output,
+            serde_json::json!({"id": 2, "method": "account/rateLimits/read"})).unwrap();
+        assert_eq!(result["ok"], true);
     }
 }

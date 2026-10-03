@@ -45,7 +45,7 @@ Each check costs ~10 tokens (Haiku).
 
 ### Codex
 
-Reads the latest local Codex session event from `~/.codex/sessions` and displays the `rate_limits` payload emitted by Codex. Codex checks are local-only and do not make an API request.
+The Linux helper asks `codex app-server` for `account/rateLimits/read`, using Codex’s default signed-in account and `CODEX_HOME`. It selects only the ordinary `codex` quota, excluding reserve/model buckets. This is a read-only network usage check; it does not start an inference turn. Failed checks report an error instead of falling back to another account’s session logs.
 
 ## Install
 
@@ -191,7 +191,7 @@ A [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar plug
 The plugin gets its numbers from the Rust helper in `linux/` (`ai-limit-counter --json <provider>`), so it shares its data sources with the KDE build:
 
 - **Claude:** reads the OAuth token Claude Code keeps in `~/.claude/.credentials.json` (the `~/.claude/claude-menubar-token` file still works as a fallback). It polls only while Claude is the selected provider: every 5 min, or every minute while `claude` is running.
-- **GPT (Codex):** reads the newest `~/.codex/sessions/**/*.jsonl`. This is local only, so it is refreshed every minute. A window whose reset time has passed is shown as reset.
+- **GPT (Codex):** asks the installed `codex` CLI for the default signed-in account’s ordinary quota every minute. Requires `codex` on PATH or in `~/.local/bin` and a ChatGPT login. Reserve/model quotas and session logs are excluded; a failed check clears the displayed Codex usage.
 
 ```bash
 cd dms

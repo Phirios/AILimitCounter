@@ -74,7 +74,10 @@ Singleton {
     function applyReport(id, text) {
         const report = Format.parseUsage(text);
         const changes = {error: report.error, fetchedAt: nowSecs()};
-        // Keep the last good numbers on screen when a refresh fails.
+        // Codex must not retain numbers from a previously signed-in account.
+        if (id === "codex")
+            changes.usage = report.usage;
+        // Keep the last good Claude numbers on screen when a refresh fails.
         if (report.usage)
             changes.usage = report.usage;
         updateEntry(id, changes);
@@ -101,7 +104,7 @@ Singleton {
         if (!livenessProcess.running)
             livenessProcess.running = true;
 
-        // Codex reads local files only, so it is always cheap to refresh.
+        // Read the default Codex account quota once per minute.
         refresh("codex", false);
         if (provider === "claude" && Format.isClaudeDue(entries.claude.fetchedAt, now, entries.claude.live))
             refresh("claude", false);
